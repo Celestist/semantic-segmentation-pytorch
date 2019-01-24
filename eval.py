@@ -1,6 +1,6 @@
 # System libs
 import os
-import datetime
+import time
 import argparse
 from distutils.version import LooseVersion
 # Numerical libs
@@ -13,21 +13,22 @@ from dataset import ValDataset
 from models import ModelBuilder, SegmentationModule
 from utils import AverageMeter, colorEncode, accuracy, intersectionAndUnion
 from lib.nn import user_scattered_collate, async_copy_to
-from lib.utils import as_numpy, mark_volatile
+from lib.utils import as_numpy
 import lib.utils.data as torchdata
 import cv2
+from tqdm import tqdm
 
 colors = loadmat('data/color150.mat')['colors']
 
 
-def visualize_result(data, preds, args):
+def visualize_result(data, pred, args):
     (img, seg, info) = data
 
     # segmentation
     seg_color = colorEncode(seg, colors)
 
     # prediction
-    pred_color = colorEncode(preds, colors)
+    pred_color = colorEncode(pred, colors)
 
     # aggregate images and save
     im_vis = np.concatenate((img, seg_color, pred_color),
@@ -42,61 +43,68 @@ def evaluate(segmentation_module, loader, args):
     acc_meter = AverageMeter()
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
+    time_meter = AverageMeter()
 
     segmentation_module.eval()
 
-    for i, batch_data in enumerate(loader):
+    pbar = tqdm(total=len(loader))
+    for batch_data in loader:
         # process data
         batch_data = batch_data[0]
         seg_label = as_numpy(batch_data['seg_label'][0])
-
         img_resized_list = batch_data['img_data']
 
+        torch.cuda.synchronize()
+        tic = time.perf_counter()
         with torch.no_grad():
             segSize = (seg_label.shape[0], seg_label.shape[1])
-            pred = torch.zeros(1, args.num_class, segSize[0], segSize[1])
+            scores = torch.zeros(1, args.num_class, segSize[0], segSize[1])
+            scores = async_copy_to(scores, args.gpu)
 
             for img in img_resized_list:
                 feed_dict = batch_data.copy()
                 feed_dict['img_data'] = img
                 del feed_dict['img_ori']
                 del feed_dict['info']
-                feed_dict = async_copy_to(feed_dict, args.gpu_id)
+                feed_dict = async_copy_to(feed_dict, args.gpu)
 
                 # forward pass
-                pred_tmp = segmentation_module(feed_dict, segSize=segSize)
-                pred = pred + pred_tmp.cpu() / len(args.imgSize)
+                scores_tmp = segmentation_module(feed_dict, segSize=segSize)
+                scores = scores + scores_tmp / len(args.imgSize)
 
-            _, preds = torch.max(pred.data.cpu(), dim=1)
-            preds = as_numpy(preds.squeeze(0))
+            _, pred = torch.max(scores, dim=1)
+            pred = as_numpy(pred.squeeze(0).cpu())
+
+        torch.cuda.synchronize()
+        time_meter.update(time.perf_counter() - tic)
 
         # calculate accuracy
-        acc, pix = accuracy(preds, seg_label)
-        intersection, union = intersectionAndUnion(preds, seg_label, args.num_class)
+        acc, pix = accuracy(pred, seg_label)
+        intersection, union = intersectionAndUnion(pred, seg_label, args.num_class)
         acc_meter.update(acc, pix)
         intersection_meter.update(intersection)
         union_meter.update(union)
-        print('[{}] iter {}, accuracy: {}'
-              .format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                      i, acc))
 
         # visualization
         if args.visualize:
             visualize_result(
                 (batch_data['img_ori'], seg_label, batch_data['info']),
-                preds, args)
+                pred, args)
 
+        pbar.update(1)
+
+    # summary
     iou = intersection_meter.sum / (union_meter.sum + 1e-10)
     for i, _iou in enumerate(iou):
-        print('class [{}], IoU: {}'.format(i, _iou))
+        print('class [{}], IoU: {:.4f}'.format(i, _iou))
 
     print('[Eval Summary]:')
-    print('Mean IoU: {:.4}, Accuracy: {:.2f}%'
-          .format(iou.mean(), acc_meter.average()*100))
+    print('Mean IoU: {:.4f}, Accuracy: {:.2f}%, Inference Time: {:.4f}s'
+          .format(iou.mean(), acc_meter.average()*100, time_meter.average()))
 
 
 def main(args):
-    torch.cuda.set_device(args.gpu_id)
+    torch.cuda.set_device(args.gpu)
 
     # Network Builders
     builder = ModelBuilder()
@@ -144,9 +152,9 @@ if __name__ == '__main__':
                         help="a name for identifying the model to load")
     parser.add_argument('--suffix', default='_epoch_20.pth',
                         help="which snapshot to load")
-    parser.add_argument('--arch_encoder', default='resnet50_dilated8',
+    parser.add_argument('--arch_encoder', default='resnet50dilated',
                         help="architecture of net_encoder")
-    parser.add_argument('--arch_decoder', default='ppm_bilinear_deepsup',
+    parser.add_argument('--arch_decoder', default='ppm_deepsup',
                         help="architecture of net_decoder")
     parser.add_argument('--fc_dim', default=2048, type=int,
                         help='number of features between encoder and decoder')
@@ -179,11 +187,15 @@ if __name__ == '__main__':
                         help='output visualization?')
     parser.add_argument('--result', default='./result',
                         help='folder to output visualization results')
-    parser.add_argument('--gpu_id', default=0, type=int,
-                        help='gpu_id for evaluation')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='gpu id for evaluation')
 
     args = parser.parse_args()
-    print(args)
+    args.arch_encoder = args.arch_encoder.lower()
+    args.arch_decoder = args.arch_decoder.lower()
+    print("Input arguments:")
+    for key, val in vars(args).items():
+        print("{:16} {}".format(key, val))
 
     # absolute paths of model weights
     args.weights_encoder = os.path.join(args.ckpt, args.id,

@@ -1,6 +1,5 @@
 # System libs
 import os
-import datetime
 import argparse
 from distutils.version import LooseVersion
 # Numerical libs
@@ -13,17 +12,19 @@ from dataset import TestDataset
 from models import ModelBuilder, SegmentationModule
 from utils import colorEncode
 from lib.nn import user_scattered_collate, async_copy_to
-from lib.utils import as_numpy, mark_volatile
+from lib.utils import as_numpy
 import lib.utils.data as torchdata
 import cv2
+from tqdm import tqdm
+
+colors = loadmat('data/color150.mat')['colors']
 
 
-def visualize_result(data, preds, args):
-    colors = loadmat('data/color150.mat')['colors']
+def visualize_result(data, pred, args):
     (img, info) = data
 
     # prediction
-    pred_color = colorEncode(preds, colors)
+    pred_color = colorEncode(pred, colors)
 
     # aggregate images and save
     im_vis = np.concatenate((img, pred_color),
@@ -37,42 +38,42 @@ def visualize_result(data, preds, args):
 def test(segmentation_module, loader, args):
     segmentation_module.eval()
 
-    for i, batch_data in enumerate(loader):
+    pbar = tqdm(total=len(loader))
+    for batch_data in loader:
         # process data
         batch_data = batch_data[0]
         segSize = (batch_data['img_ori'].shape[0],
                    batch_data['img_ori'].shape[1])
-
         img_resized_list = batch_data['img_data']
 
         with torch.no_grad():
-            pred = torch.zeros(1, args.num_class, segSize[0], segSize[1])
+            scores = torch.zeros(1, args.num_class, segSize[0], segSize[1])
+            scores = async_copy_to(scores, args.gpu)
 
             for img in img_resized_list:
                 feed_dict = batch_data.copy()
                 feed_dict['img_data'] = img
                 del feed_dict['img_ori']
                 del feed_dict['info']
-                feed_dict = async_copy_to(feed_dict, args.gpu_id)
+                feed_dict = async_copy_to(feed_dict, args.gpu)
 
                 # forward pass
                 pred_tmp = segmentation_module(feed_dict, segSize=segSize)
-                pred = pred + pred_tmp.cpu() / len(args.imgSize)
+                scores = scores + pred_tmp / len(args.imgSize)
 
-            _, preds = torch.max(pred, dim=1)
-            preds = as_numpy(preds.squeeze(0))
+            _, pred = torch.max(scores, dim=1)
+            pred = as_numpy(pred.squeeze(0).cpu())
 
         # visualization
         visualize_result(
             (batch_data['img_ori'], batch_data['info']),
-            preds, args)
+            pred, args)
 
-        print('[{}] iter {}'
-              .format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), i))
+        pbar.update(1)
 
 
 def main(args):
-    torch.cuda.set_device(args.gpu_id)
+    torch.cuda.set_device(args.gpu)
 
     # Network Builders
     builder = ModelBuilder()
@@ -92,11 +93,12 @@ def main(args):
     segmentation_module = SegmentationModule(net_encoder, net_decoder, crit)
 
     # Dataset and Loader
-    list_test = [{'fpath_img': args.test_img}]
-    dataset_val = TestDataset(
+    # list_test = [{'fpath_img': args.test_img}]
+    list_test = [{'fpath_img': x} for x in args.test_imgs]
+    dataset_test = TestDataset(
         list_test, args, max_sample=args.num_val)
-    loader_val = torchdata.DataLoader(
-        dataset_val,
+    loader_test = torchdata.DataLoader(
+        dataset_test,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=user_scattered_collate,
@@ -106,7 +108,7 @@ def main(args):
     segmentation_module.cuda()
 
     # Main loop
-    test(segmentation_module, loader_val, args)
+    test(segmentation_module, loader_test, args)
 
     print('Inference done!')
 
@@ -117,16 +119,17 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     # Path related arguments
-    parser.add_argument('--test_img', required=True)
+    parser.add_argument('--test_imgs', required=True, nargs='+', type=str,
+                        help='a list of image paths that needs to be tested')
     parser.add_argument('--model_path', required=True,
                         help='folder to model path')
     parser.add_argument('--suffix', default='_epoch_20.pth',
                         help="which snapshot to load")
 
     # Model related arguments
-    parser.add_argument('--arch_encoder', default='resnet50_dilated8',
+    parser.add_argument('--arch_encoder', default='resnet50dilated',
                         help="architecture of net_encoder")
-    parser.add_argument('--arch_decoder', default='ppm_bilinear_deepsup',
+    parser.add_argument('--arch_decoder', default='ppm_deepsup',
                         help="architecture of net_decoder")
     parser.add_argument('--fc_dim', default=2048, type=int,
                         help='number of features between encoder and decoder')
@@ -152,11 +155,15 @@ if __name__ == '__main__':
     # Misc arguments
     parser.add_argument('--result', default='.',
                         help='folder to output visualization results')
-    parser.add_argument('--gpu_id', default=0, type=int,
-                        help='gpu_id for evaluation')
+    parser.add_argument('--gpu', default=0, type=int,
+                        help='gpu id for evaluation')
 
     args = parser.parse_args()
-    print(args)
+    args.arch_encoder = args.arch_encoder.lower()
+    args.arch_decoder = args.arch_decoder.lower()
+    print("Input arguments:")
+    for key, val in vars(args).items():
+        print("{:16} {}".format(key, val))
 
     # absolute paths of model weights
     args.weights_encoder = os.path.join(args.model_path,
